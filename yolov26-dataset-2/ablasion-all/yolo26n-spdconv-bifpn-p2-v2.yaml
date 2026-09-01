@@ -1,0 +1,123 @@
+# =====================================================================
+# [n-scale kopyasi] YOLO26 + SPD-Conv + P2 head + BiFPN  ***v2***
+# Hedef veri seti: dataset-2 = roboflow ke-project/yolo-tb1l6
+#                  (2 sinif: crack, dent | 2747/568/279 goruntu, 640x640)
+#
+# v1 (spdconv_bifpn_p2.yaml) -> v2 FARKLARI
+# ---------------------------------------------------------------------
+# 1) SCALE n -> s
+#    Dosya adindaki "yolo26s" oneki Ultralytics'in scale regex'ine
+#    (yolo[v]?\d+([nslmx])) takilir; width 0.25 -> 0.50 olur, yani
+#    kanal sayilari iki katina cikar. Kullanicinin "model agirlasabilir"
+#    onayi var. 2747 goruntuluk bir veri setinde 'n' genislik, P2
+#    dalindaki yuksek cozunurluklu ama az kanalli haritalar icin
+#    darbogaz; en ucuz ve en guvenilir kazanc buradan gelir.
+#    (Ayni dosyayi 'yolo26n-spdconv-bifpn-p2-v2.yaml' adiyla
+#     kopyalayip 'n' ile ablasyon yapabilirsin.)
+#
+# 2) GERCEK BiFPN: 3 GIRISLI FUZYON DUGUMLERI
+#    v1'de tum fuzyonlar 2 girisliydi (PANet ile ayni topoloji, sadece
+#    agirlikli). Gercek BiFPN'de bottom-up yolundaki ARA seviyeler
+#    3 girislidir:  bottom-up + top-down + BACKBONE KISAYOLU.
+#    v2'de katman 21 (P3) ve katman 24 (P4) uc girisli:
+#       21: [20 (P2'den asagi), 16 (P3 top-down), 4 (P3 backbone)]
+#       24: [23 (P3'ten asagi), 13 (P4 top-down), 6 (P4 backbone)]
+#    Backbone kisayolu, top-down yolunda 2 kez yeniden ornekleme
+#    yuzunden bulanan ince detayin (crack kenarlari) orijinal
+#    cozunurluklu halini geri getirir. Bu, kucuk nesne mAP'inde
+#    BiFPN'in asil katkisinin geldigi yerdir.
+#
+# 3) CAA (serit konvolusyonlu dikkat) NECK'TE
+#    P3 top-down (16), P2 cikis (19) ve P3 cikis (22) bloklari
+#    C3k2 -> C3k2CAA oldu. Gerekce (etiket istatistigi):
+#    w/h orani 95. yuzdelik 4.25, 99. yuzdelik 39.16 -> crack kutulari
+#    cizgisel. 1x11 + 11x1 depthwise serit konvolusyon, kare receptive
+#    field'in aksine catlagin uzandigi yon boyunca baglam toplar.
+#    Sadece kucuk/orta seviyelere konuldu; P4/P5'te (buyuk dent'ler)
+#    kare baglam zaten yeterli, bosuna maliyet olmasin.
+#
+# 4) NECK DERINLIGI 2 -> 4 (depth=0.50 sonrasi 1 -> 2 blok)
+#    v1'de depth carpani 0.50 oldugu icin YAML'daki "2" tekrar
+#    max(round(2*0.5),1) = 1'e dusuyordu; yani neck'teki her C3k2
+#    TEK bloktu. P3/P4 seviyelerinde 4 yazarak gercekten 2 blok elde
+#    ediyoruz. P2 (stride 4, 160x160) ve P5 pahali/gereksiz oldugu icin
+#    orada 2 (->1) kaldi.
+#
+# 5) P2 KANALI 128 -> 256 (scale sonrasi 32 -> 128, 4 kat)
+#    valid/test'te kutularin ~%39'u <32px. v1'de P2 detect kaynagi
+#    sadece 32 kanaldi - dagitimin en kalabalik kismina en zayif
+#    temsil. En buyuk VRAM maliyeti de burada; batch'i buna gore sec.
+#
+# 6) DETECT girdileri v1 ile ayni indekslerde (19, 22, 25, 28) tutuldu
+#    ki iki YAML arasinda karsilastirma/ablasyon yaparken kafa
+#    karismasin.
+#
+# NOT: Concat satirlari YAML'da PLAIN 'Concat' olarak birakildi;
+# modules_v2.register_v2() bunlari WeightedConcatN (BiFPN) ile
+# degistiriyor. CAA / C3k2CAA isimleri de ayni fonksiyonun kurdugu
+# parse_model wrapper'i sayesinde cozuluyor.
+# =====================================================================
+
+nc: 80 # number of classes (data.yaml ile override edilir)
+end2end: True # YOLO26 end-to-end (NMS-free) mod
+reg_max: 1 # DFL bins
+scales:
+  # [depth, width, max_channels]
+  n: [0.50, 0.25, 1024]
+  s: [0.50, 0.50, 1024]
+  m: [0.50, 1.00, 512]
+  l: [1.00, 1.00, 512]
+  x: [1.00, 1.50, 512]
+
+# ---------------------------------------------------------------------
+# Backbone - SPD-Conv'lu. Katman indeksleri (0..10) stok YOLO26 ile
+# BIREBIR AYNI tutuldu: boylece COCO on-egitimli yolo26s.pt yuklenirken
+# model.2 / model.4 / model.6 / model.8 / model.9 / model.10 anahtarlari
+# isim+shape olarak eslesir ve transfer edilir. (model.0/1/3/5/7
+# SPDConv oldugu icin shape uyusmaz, atlanir - beklenen davranis.)
+# ---------------------------------------------------------------------
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, SPDConv, [64, 3, 2]] # 0-P1/2
+  - [-1, 1, SPDConv, [128, 3, 2]] # 1-P2/4
+  - [-1, 2, C3k2, [256, False, 0.25]] # 2  P2 backbone  <- P2 dali + BiFPN kisayolu
+  - [-1, 1, SPDConv, [256, 3, 2]] # 3-P3/8
+  - [-1, 2, C3k2, [512, False, 0.25]] # 4  P3 backbone  <- BiFPN kisayolu (kat. 21)
+  - [-1, 1, SPDConv, [512, 3, 2]] # 5-P4/16
+  - [-1, 2, C3k2, [512, True]] # 6  P4 backbone  <- BiFPN kisayolu (kat. 24)
+  - [-1, 1, SPDConv, [1024, 3, 2]] # 7-P5/32
+  - [-1, 2, C3k2, [1024, True]] # 8
+  - [-1, 1, SPPF, [1024, 5, 3, True]] # 9
+  - [-1, 2, C2PSA, [1024]] # 10 P5 backbone
+
+# ---------------------------------------------------------------------
+# Head - BiFPN topolojisi (top-down + bottom-up, 3 girisli ara dugumler)
+# ---------------------------------------------------------------------
+head:
+  # ---------------- Top-down: P5 -> P4 -> P3 -> P2 ----------------
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]] # 11
+  - [[-1, 6], 1, Concat, [1]] # 12 F1: P5up + P4bb
+  - [-1, 4, C3k2, [512, True]] # 13 P4 top-down  (BiFPN ara dugum, kat.24'e girer)
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]] # 14
+  - [[-1, 4], 1, Concat, [1]] # 15 F2: P4td_up + P3bb
+  - [-1, 4, C3k2CAA, [256, True]] # 16 P3 top-down  (serit dikkat, kat.21'e girer)
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]] # 17
+  - [[-1, 2], 1, Concat, [1]] # 18 F3: P3td_up + P2bb
+  - [-1, 2, C3k2CAA, [256, True]] # 19 P2/4-xsmall  *** DETECT ***
+
+  # ---------------- Bottom-up: P2 -> P3 -> P4 -> P5 (SPD-Conv) ----------------
+  - [-1, 1, SPDConv, [256, 3, 2]] # 20 P2 -> P3
+  - [[-1, 16, 4], 1, Concat, [1]] # 21 F4: 3 GIRIS (bottom-up + top-down + backbone)
+  - [-1, 4, C3k2CAA, [256, True]] # 22 P3/8-small   *** DETECT ***
+
+  - [-1, 1, SPDConv, [256, 3, 2]] # 23 P3 -> P4
+  - [[-1, 13, 6], 1, Concat, [1]] # 24 F5: 3 GIRIS (bottom-up + top-down + backbone)
+  - [-1, 4, C3k2, [512, True]] # 25 P4/16-medium *** DETECT ***
+
+  - [-1, 1, SPDConv, [512, 3, 2]] # 26 P4 -> P5
+  - [[-1, 10], 1, Concat, [1]] # 27 F6: P4down + P5bb
+  - [-1, 2, C3k2, [1024, True, 0.5, True]] # 28 P5/32-large  *** DETECT ***
+
+  - [[19, 22, 25, 28], 1, Detect, [nc]] # 29 Detect(P2, P3, P4, P5)

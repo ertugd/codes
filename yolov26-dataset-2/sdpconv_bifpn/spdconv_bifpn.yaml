@@ -1,0 +1,58 @@
+# YOLO26n + SPDConv + BiFPN
+#
+# Notes:
+# 1) SPDConv must be added as a real Ultralytics module.
+#    Do not monkey-patch Conv -> SPDConv.
+# 2) BiFPN is applied by keeping Concat in YAML and patching
+#    Concat -> WeightedConcat in the training script.
+# 3) This YAML does not include ECA, ConSAM, RepC3k2, CBAM, or CoordAtt.
+#
+# Placement:
+# - SPDConv replaces all stride=2 downsampling Conv layers.
+# - BiFPN is used at the 4 multi-scale fusion Concat points through Python patching.
+
+nc: 80
+end2end: True
+reg_max: 1
+
+scales:
+  n: [0.50, 0.25, 1024]
+  s: [0.50, 0.50, 1024]
+  m: [0.50, 1.00, 512]
+  l: [1.00, 1.00, 512]
+  x: [1.00, 1.50, 512]
+
+backbone:
+  - [-1, 1, SPDConv, [64, 3, 2]]        # 0   ✅ transfer
+  - [-1, 1, SPDConv, [128, 3, 2]]       # 1   ✅ transfer
+  - [-1, 2, C3k2, [256, False, 0.25]]   # 2   ✅ transfer  (P2 backbone feature)
+  - [-1, 1, SPDConv, [256, 3, 2]]       # 3   ✅ transfer
+  - [-1, 2, C3k2, [512, False, 0.25]]   # 4   ✅ transfer  (P3 backbone)
+  - [-1, 1, SPDConv, [512, 3, 2]]       # 5   ✅ transfer
+  - [-1, 2, C3k2, [512, True]]          # 6   ✅ transfer  (P4 backbone)
+  - [-1, 1, SPDConv, [1024, 3, 2]]      # 7   ✅ transfer
+  - [-1, 2, C3k2, [1024, True]]         # 8   ✅ transfer
+  - [-1, 1, SPPF, [1024, 5, 3, True]]   # 9   ✅ transfer
+  - [-1, 2, C2PSA, [1024]]              # 10  ✅ transfer  (P5 backbone)
+
+head:
+  # --- baseline ile BİREBİR AYNI index/isim/shape sırası: 11-22 ---
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]  # 11 ✅ transfer
+  - [[-1, 6], 1, Concat, [1]]                    # 12 ✅ transfer
+  - [-1, 2, C3k2, [512, True]]                   # 13 ✅ transfer  (P4_td)
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]   # 14 ✅ transfer
+  - [[-1, 4], 1, Concat, [1]]                    # 15 ✅ transfer
+  - [-1, 2, C3k2, [256, True]]                   # 16 ✅ transfer  (P3_td → hem eski Detect girişiydi hem yeni P2 dalını besleyecek)
+  - [-1, 1, SPDConv, [256, 3, 2]]                # 17 ✅ transfer
+  - [[-1, 13], 1, Concat, [1]]                    # 18 ✅ transfer
+  - [-1, 2, C3k2, [512, True]]                    # 19 ✅ transfer  (P4/16-medium)
+  - [-1, 1, SPDConv, [512, 3, 2]]                 # 20 ✅ transfer
+  - [[-1, 10], 1, Concat, [1]]                     # 21 ✅ transfer
+  - [-1, 1, C3k2, [1024, True, 0.5, True]]         # 22 ✅ transfer  (P5/32-large)
+
+  # --- YENİ EKLENEN P2 dalı: sona iliştirildi, hiçbir eski index'i BOZMUYOR ---
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]     # 23 ⚠️ yeni (rastgele init)
+  - [[-1, 2], 1, Concat, [1]]                       # 24 ⚠️ yeni (rastgele init) — backbone P2 (layer 2) ile birleşiyor
+  - [-1, 2, C3k2, [128, True]]                      # 25 ⚠️ yeni (rastgele init) — P2/4-xsmall çıkışı
+
+  - [[25, 16, 19, 22], 1, Detect, [nc]]             # 26 ⚠️ yeni (rastgele init) — artık 4 ölçekli, Detect'in cv2/cv3 dalları eski 3-ölçekliyle shape uyuşmuyor
